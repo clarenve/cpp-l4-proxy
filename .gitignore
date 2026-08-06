@@ -1,0 +1,12 @@
+# CMake build output
+/build/
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Compilation database copied to repository root
+compile_commands.json
