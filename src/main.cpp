@@ -13,29 +13,148 @@
 #include <array>
 #include <vector>
 #include <atomic>
+#include <utility>
+#include <chrono>
 
 namespace{
 
     struct Backend{
         std::string address;
         std::uint16_t port;
+        std::atomic<bool> healthy{true};
+
+        Backend(std::string address, std::uint16_t port)
+            : address{std::move(address)},
+            port{port},
+            healthy{true}
+        {}
     };
 
-    const std::vector<Backend> backends{
-        {"127.0.0.1", 9001},
-        {"127.0.0.1", 9002},
-        {"127.0.0.1", 9003}
+    std::array<Backend, 3> backends{
+        Backend{"127.0.0.1", 9001},
+        Backend{"127.0.0.1", 9002},
+        Backend{"127.0.0.1", 9003}
     };
 
     std::atomic<std::size_t> next_backend_index{0};
 
-    const Backend& choose_backend(){
-        const std::size_t index = next_backend_index.fetch_add(
-            1,
-            std::memory_order_relaxed
+    enum class HealthCheckResult{
+        healthy,
+        unhealthy,
+        check_failed
+    };
+
+    HealthCheckResult check_backend_health(const Backend& backend){
+        const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+
+        if(socket_fd == -1){
+            std::cerr
+                << "Health check socket creation failed: "
+                << std::strerror(errno)
+                << '\n';
+
+            return HealthCheckResult::check_failed;
+        }
+
+        sockaddr_in backend_address{};
+        backend_address.sin_family = AF_INET;
+        backend_address.sin_port = htons(backend.port);
+
+        int result = inet_pton(
+            AF_INET,
+            backend.address.c_str(),
+            &backend_address.sin_addr
         );
 
-        return backends[index % backends.size()];
+        if(result == 0){
+            ::close(socket_fd);
+
+            std::cerr
+                << "Invalid backend IP address: "
+                << backend.address
+                << '\n';
+            
+            return HealthCheckResult::check_failed;
+
+        }else if(result == -1){
+            int errorcode = errno;
+            ::close(socket_fd);
+
+            std::cerr
+                << "inet_pton failed: "
+                << std::strerror(errorcode)
+                << '\n';
+
+            return HealthCheckResult::check_failed;
+
+        }
+
+        if(::connect(
+            socket_fd,
+            reinterpret_cast<sockaddr*>(&backend_address),
+            sizeof(backend_address)) == -1){
+                ::close(socket_fd);
+
+                return HealthCheckResult::unhealthy;
+            }
+
+        ::close(socket_fd);
+
+        return HealthCheckResult::healthy;
+
+    }
+
+    const Backend& choose_backend(){
+        const std::size_t start_index = next_backend_index.fetch_add(
+            1,
+            std::memory_order_relaxed);
+
+        for(std::size_t offset = 0; offset < backends.size(); offset++){
+            Backend& backend = backends[(start_index + offset) % backends.size()];
+
+            if(backend.healthy.load(std::memory_order_relaxed)){
+                return backend;
+            }
+        }
+
+        throw std::runtime_error("No healthy backends available");
+    }
+
+    void health_check_loop(){
+        while(1){
+            for(Backend& backend : backends){
+                HealthCheckResult result = check_backend_health(backend);
+
+                bool is_healthy{true};
+
+                if(result == HealthCheckResult::check_failed){
+                    continue;
+
+                }else if(result == HealthCheckResult::unhealthy){
+                    is_healthy = false;
+
+                }
+                
+                const bool previous_health = backend.healthy.exchange(
+                    is_healthy,
+                    std::memory_order_relaxed);
+
+                if(is_healthy != previous_health){
+                    std::cout
+                        << "Backend "
+                        << backend.address
+                        << ':'
+                        << backend.port
+                        << " health changed. New status: "
+                        << (is_healthy ? "healthy" : "unhealthy")
+                        << '\n';
+                }
+            }
+
+            std::this_thread::sleep_for(
+                std::chrono::seconds{2});
+
+        }
     }
 
     constexpr std::uint16_t server_port = 8080;
@@ -257,6 +376,11 @@ namespace{
 int main(){
     try{
         const int listening_fd = create_listening_socket(server_port);
+
+        std::thread health_check_thread{
+            health_check_loop};
+
+        health_check_thread.detach();
 
         std::cout
             << "Server listening on port "
