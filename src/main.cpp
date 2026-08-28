@@ -57,6 +57,11 @@ namespace{
         int socket_fd;
     };
 
+    struct SendResult{
+        bool success;
+        int errorcode;
+    };
+
     std::array<Backend, 3> backends{
         Backend{"127.0.0.1", 9001},
         Backend{"127.0.0.1", 9002},
@@ -71,12 +76,27 @@ namespace{
         check_failed
     };
 
+    void disable_sigpipe(int socket_fd){
+        const int value = 1;
+
+        if(::setsockopt(
+            socket_fd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            &value,
+            sizeof(value)) == -1){
+                throw_system_error("setsockopt(SO_NOSIGPIPE)", errno);
+            }
+    }
+
     std::optional<int> try_connect_to_backend(const Backend& backend, std::chrono::milliseconds timeout){
         const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
 
         if(socket_fd == -1){
             throw_system_error("socket", errno);
         }
+
+        disable_sigpipe(socket_fd);
 
         sockaddr_in backend_address{};
         backend_address.sin_family = AF_INET;
@@ -325,7 +345,7 @@ namespace{
 
     }
 
-    void send_all(int socket_fd, std::span<const char> data){
+    SendResult send_all(int socket_fd, std::span<const char> data){
         std::size_t total_sent = 0;
 
         while(total_sent < data.size()){
@@ -339,14 +359,30 @@ namespace{
             if(bytes_sent == -1){
                 if(errno == EINTR){
                     continue;
+
                 }else{
-                    throw_system_error("send", errno);
+                    return SendResult{
+                        false,
+                        errno
+                    };
+
                 }
             }
 
-            total_sent += static_cast<std::size_t>(bytes_sent);
+            if(bytes_sent == 0){
+                return SendResult{
+                    false,
+                    0
+                };
+            }
 
+            total_sent += static_cast<std::size_t>(bytes_sent);
         }
+
+        return SendResult{
+            true,
+            0
+        };
 
     }
 
@@ -444,13 +480,48 @@ namespace{
                     return;
                 }
 
-                send_all(
+                const SendResult send_result = send_all(
                     destination_fd,
                     std::span<const char>{
                         buffer.data(),
                         static_cast<std::size_t>(bytes_received)
                     }
                 );
+
+                if(!send_result.success){
+                    if(direction == ForwardDirection::client_to_backend){
+                        //sending to backend failed means there is an issue with the backend
+                        switch(send_result.errorcode){
+                            case EPIPE:
+                            case ECONNRESET:
+                            case ETIMEDOUT:
+                            case ENETRESET:
+                                set_backend_health(
+                                    backend,
+                                    false
+                                );
+                                break;
+
+                            default:
+                                break;
+
+                        }
+                    }
+
+                    if(send_result.errorcode != 0){
+                        //send() failed with errno error (send() == -1)
+                        throw_system_error(
+                            "send",
+                            send_result.errorcode
+                        );
+                    }
+
+                    throw std::runtime_error(
+                        "send made no progress"
+                    );
+                    
+                }
+
             }
         }catch (const std::exception& error){
             std::cerr
@@ -532,6 +603,8 @@ int main(){
 
                 throw_system_error("accept", errno);
             }
+
+            disable_sigpipe(client_fd);
 
             print_client_address(client_address);
 
