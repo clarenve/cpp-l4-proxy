@@ -40,6 +40,59 @@ namespace{
         );
     }
 
+    class Socket{
+    private:
+        int fd_;
+    public:
+        explicit Socket(int fd)
+            : fd_{fd}
+        {}
+
+        ~Socket(){
+            if(fd_ != -1){
+                ::close(fd_);
+            }
+        }
+        
+        //copy constructor
+        Socket(const Socket&) = delete;
+
+        //copy assignment
+        Socket& operator=(const Socket&) = delete;
+
+        //move constructor
+        Socket(Socket&& other) noexcept
+            : fd_{other.fd_}
+        {
+            other.fd_ = -1;
+        }
+
+        //move assignment
+        Socket& operator=(Socket&& other) noexcept{
+            if(this != &other){
+                //protection against self move assignment
+                if(fd_ != -1){
+                    ::close(fd_);
+                }
+
+                fd_ = other.fd_;
+                other.fd_ = -1;
+            }
+
+            return *this;
+        }
+
+        int get() const noexcept{
+            return fd_;
+        }
+
+        int release() noexcept{
+            const int fd = fd_;
+            fd_ = -1;
+            return fd;
+        }
+    };
+
     struct Backend{
         std::string address;
         std::uint16_t port;
@@ -54,7 +107,7 @@ namespace{
 
     struct BackendConnection{
         Backend* backend;
-        int socket_fd;
+        Socket socket;
     };
 
     struct SendResult{
@@ -89,14 +142,16 @@ namespace{
             }
     }
 
-    std::optional<int> try_connect_to_backend(const Backend& backend, std::chrono::milliseconds timeout){
+    std::optional<Socket> try_connect_to_backend(const Backend& backend, std::chrono::milliseconds timeout){
         const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
 
         if(socket_fd == -1){
             throw_system_error("socket", errno);
         }
 
-        disable_sigpipe(socket_fd);
+        Socket socket{socket_fd};
+
+        disable_sigpipe(socket.get());
 
         sockaddr_in backend_address{};
         backend_address.sin_family = AF_INET;
@@ -109,7 +164,6 @@ namespace{
 
         if(address_result == 0){ //stored backend ip address is bad/invalid
             //no need for errno cause address_reuslt == 0 means invalid ip. errno used if inet_pton returns -1
-            ::close(socket_fd);
 
             throw std::runtime_error(
                 "Invalid backend IP address: " + backend.address);
@@ -117,69 +171,53 @@ namespace{
         }
 
         if(address_result == -1){
-            const int errorcode = errno;
-            ::close(socket_fd);
-
-            throw_system_error("inet_pton", errorcode);
+            throw_system_error("inet_pton", errno);
         }
 
-        const int original_flags = ::fcntl(socket_fd, F_GETFL, 0); //get socket's current file status-flags
+        const int original_flags = ::fcntl(socket.get(), F_GETFL, 0); //get socket's current file status-flags
 
         if(original_flags == -1){
-            int errorcode = errno;
-            
-            ::close(socket_fd);
-            
-            throw_system_error("fcntl(F_GETFL)", errorcode);
+            throw_system_error("fcntl(F_GETFL)", errno);
         }
 
         if(::fcntl(
-            socket_fd,
+            socket.get(),
             F_SETFL,
             original_flags | O_NONBLOCK) == -1){
-                const int errorcode = errno;
-                
-                ::close(socket_fd);
-
-                throw_system_error("fcntl(F_SETFL)", errorcode);
+                throw_system_error("fcntl(F_SETFL)", errno);
             }
         
 
         const int connect_result = ::connect(
-            socket_fd,
+            socket.get(),
             reinterpret_cast<sockaddr*>(&backend_address),
             sizeof(backend_address)
         );
         
-        if(connect_result == -1 && errno != EINPROGRESS && errno != EINTR){
-            ::close(socket_fd);
-
-            return std::nullopt;
-        }
-
         if(connect_result == -1){
+            const int errorcode = errno;
+
+            if(errorcode != EINPROGRESS && errorcode != EINTR){
+                return std::nullopt;
+            }
+            
             pollfd poll_fd{};
-            poll_fd.fd = socket_fd;
+            poll_fd.fd = socket.get();
             poll_fd.events = POLLOUT;
 
             const int poll_result = ::poll(&poll_fd, 1, static_cast<int>(timeout.count()));
 
             if(poll_result == 0){
                 //timeout
-                ::close(socket_fd);
                 
                 return std::nullopt;
             }
 
             if(poll_result == -1){
-                const int errorcode = errno;
-
-                ::close(socket_fd);
-
-                if(errorcode == EINTR){
+                if(errno == EINTR){
                     return std::nullopt;
                 }else{
-                    throw_system_error("poll", errorcode);
+                    throw_system_error("poll", errno);
                 }
             }
 
@@ -187,49 +225,37 @@ namespace{
             socklen_t error_length = sizeof(socket_error);
 
             if(::getsockopt(
-                socket_fd,
+                socket.get(),
                 SOL_SOCKET,
                 SO_ERROR,
                 &socket_error,
                 &error_length) == -1){
-                    const int errorcode = errno;
-
-                    ::close(socket_fd);
-                    
-                    throw_system_error("getsockopt(SO_ERROR)", errorcode);
+                    throw_system_error("getsockopt(SO_ERROR)", errno);
                 }
             
             if(socket_error != 0){
-                ::close(socket_fd);
-
                 return std::nullopt;
             }
         }
 
             //socket_error == 0 or connect_result == 0 means connection successful
             if(::fcntl(
-                socket_fd,
+                socket.get(),
                 F_SETFL,
                 original_flags) == -1){
-                    const int errorcode = errno;
-                    
-                    ::close(socket_fd);
-                    
-                    throw_system_error("fcntl(F_SETFL)", errorcode);
+                    throw_system_error("fcntl(F_SETFL)", errno);
                 }
             
-            return socket_fd;
+            return socket;
     }
 
     HealthCheckResult check_backend_health(const Backend& backend){
         try{
-            const std::optional<int> socket_fd = try_connect_to_backend(backend, health_check_timeout);
+            const std::optional<Socket> socket = try_connect_to_backend(backend, health_check_timeout);
 
-            if(!socket_fd.has_value()){
+            if(!socket.has_value()){
                 return HealthCheckResult::unhealthy;
             }
-
-            ::close(*socket_fd);
             
             return HealthCheckResult::healthy;
 
@@ -301,24 +327,24 @@ namespace{
         }
     }
 
-    int create_listening_socket(std::uint16_t port){
+    Socket create_listening_socket(std::uint16_t port){
         const int socket_fd = ::socket(AF_INET, SOCK_STREAM, 0);
 
         if(socket_fd == -1){
             throw_system_error("socket", errno);
         }
 
+        Socket socket{socket_fd};
+
         const int reuse_address = 1;
 
         if(::setsockopt(
-            socket_fd,
+            socket.get(),
             SOL_SOCKET,
             SO_REUSEADDR,
             &reuse_address,
             sizeof(reuse_address)) == -1){
-                int errorcode = errno;
-                ::close(socket_fd);
-                throw_system_error("setsockopt", errorcode);
+                throw_system_error("setsockopt", errno);
             }
 
         sockaddr_in server_address{};
@@ -327,21 +353,17 @@ namespace{
         server_address.sin_port = htons(port); //port of ip
 
         if(::bind(
-            socket_fd,
+            socket.get(),
             reinterpret_cast<const sockaddr*>(&server_address),
             sizeof(server_address)) == -1){
-                int errorcode = errno;
-                ::close(socket_fd);
-                throw_system_error("bind", errorcode);
+                throw_system_error("bind", errno);
             }
             
-        if(::listen(socket_fd, listen_backlog) == -1){
-            int errorcode = errno;
-            ::close(socket_fd);
-            throw_system_error("listen", errorcode);
+        if(::listen(socket.get(), listen_backlog) == -1){
+            throw_system_error("listen", errno);
         }
 
-        return socket_fd;
+        return socket;
 
     }
 
@@ -414,15 +436,15 @@ namespace{
         for(std::size_t attempts = 0; attempts < backends.size(); attempts++){
             Backend& backend = choose_backend();
 
-            const std::optional<int> socket_fd = 
+            std::optional<Socket> socket = 
                 try_connect_to_backend(
                     backend, 
                     backend_connect_timeout);
             
-            if(socket_fd.has_value()){
+            if(socket.has_value()){
                 return BackendConnection{
                     &backend,
-                    *socket_fd};
+                    std::move(*socket)};
             }
             
             //if socket_fd does not have value, this backend is unhealthy
@@ -534,12 +556,10 @@ namespace{
         }
     }
 
-    void proxy_connection(int client_fd){
+    void proxy_connection(Socket client_socket){
         BackendConnection connection = connect_to_healthy_backend();
 
         Backend& backend = *connection.backend;
-
-        const int backend_fd = connection.socket_fd;
 
         std::cout
             << "Selected backend: "
@@ -550,16 +570,16 @@ namespace{
 
         std::thread client_to_backend{
             forward_data,
-            client_fd,
-            backend_fd,
+            client_socket.get(),
+            connection.socket.get(),
             std::ref(backend),
             ForwardDirection::client_to_backend
         };
 
         std::thread backend_to_client{
             forward_data,
-            backend_fd,
-            client_fd,
+            connection.socket.get(),
+            client_socket.get(),
             std::ref(backend),
             ForwardDirection::backend_to_client
         };
@@ -567,14 +587,13 @@ namespace{
         client_to_backend.join();
         backend_to_client.join();
 
-        ::close(backend_fd);
     }
 
 } //namespace
 
 int main(){
     try{
-        const int listening_fd = create_listening_socket(server_port);
+        Socket listening_socket = create_listening_socket(server_port);
 
         std::thread health_check_thread{
             health_check_loop};
@@ -591,7 +610,7 @@ int main(){
             socklen_t client_address_length = sizeof(client_address);
 
             const int client_fd = ::accept(
-                listening_fd,
+                listening_socket.get(),
                 reinterpret_cast<sockaddr*>(&client_address),
                 &client_address_length
             );
@@ -604,14 +623,16 @@ int main(){
                 throw_system_error("accept", errno);
             }
 
-            disable_sigpipe(client_fd);
+            Socket client_socket{client_fd};
+
+            disable_sigpipe(client_socket.get());
 
             print_client_address(client_address);
 
             std::thread connection_thread{
-                [client_fd](){
+                [client_socket = std::move(client_socket)]() mutable{
                     try{
-                        proxy_connection(client_fd);
+                        proxy_connection(std::move(client_socket));
                     }catch(const std::exception& error){
                         std::cerr
                             << "Client connection error:"
@@ -619,7 +640,6 @@ int main(){
                             << "\n";
                     }
 
-                    ::close(client_fd);
                 }
             };
 
