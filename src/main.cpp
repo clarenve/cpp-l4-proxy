@@ -18,6 +18,11 @@
 #include <poll.h>
 #include <optional>
 #include <functional>
+#include <vector>
+#include <system_error>
+#include <csignal>
+#include <signal.h>
+#include <memory>
 
 namespace{
 
@@ -29,29 +34,46 @@ namespace{
     constexpr auto backend_connect_timeout = std::chrono::milliseconds{1000};
     constexpr auto health_check_timeout = std::chrono::milliseconds{500};
 
+    volatile std::sig_atomic_t shutdown_signal_received = 0;
+
+    std::atomic<bool> stop_requested{false};
+
     enum class ForwardDirection{
         client_to_backend,
         backend_to_client
     };
 
     [[noreturn]] void throw_system_error(const std::string& operation, int errorcode){
-        throw std::runtime_error(
-            operation + " failed " + std::strerror(errorcode)
+        throw std::system_error(
+            errorcode,
+            std::generic_category(),
+            operation
         );
+        
+        // throw std::runtime_error(
+        //     operation + " failed " + std::strerror(errorcode)
+        // );
+    }
+
+    void handle_shutdown_signal(int){
+        shutdown_signal_received = 1;
     }
 
     class Socket{
     private:
-        int fd_;
+        static constexpr int invalid_fd = -1;
+        
+        int fd_ = invalid_fd;
+
     public:
-        explicit Socket(int fd)
+        Socket() noexcept = default;
+
+        explicit Socket(int fd) noexcept
             : fd_{fd}
         {}
 
         ~Socket(){
-            if(fd_ != -1){
-                ::close(fd_);
-            }
+            reset();
         }
         
         //copy constructor
@@ -64,19 +86,17 @@ namespace{
         Socket(Socket&& other) noexcept
             : fd_{other.fd_}
         {
-            other.fd_ = -1;
+            other.fd_ = invalid_fd;
         }
 
         //move assignment
         Socket& operator=(Socket&& other) noexcept{
             if(this != &other){
                 //protection against self move assignment
-                if(fd_ != -1){
-                    ::close(fd_);
-                }
+                reset();
 
                 fd_ = other.fd_;
-                other.fd_ = -1;
+                other.fd_ = invalid_fd;
             }
 
             return *this;
@@ -86,10 +106,23 @@ namespace{
             return fd_;
         }
 
+        bool valid() const noexcept{
+            return fd_ != invalid_fd;
+        }
+
         int release() noexcept{
             const int fd = fd_;
-            fd_ = -1;
+            fd_ = invalid_fd;
             return fd;
+        }
+
+        void reset(int new_fd = invalid_fd) noexcept{
+            //assign this socket's fd_ with new_fd. assign -1 by default when called without arguments
+            if(fd_ != invalid_fd && fd_ != new_fd){
+                ::close(fd_);
+            }
+
+            fd_ = new_fd;
         }
     };
 
@@ -308,7 +341,7 @@ namespace{
     }
 
     void health_check_loop(){
-        while(1){
+        while(!stop_requested.load(std::memory_order_relaxed)){
             for(Backend& backend : backends){
                 HealthCheckResult result = check_backend_health(backend);
 
@@ -447,7 +480,7 @@ namespace{
                     std::move(*socket)};
             }
             
-            //if socket_fd does not have value, this backend is unhealthy
+            //if socket does not have value, this backend is unhealthy
             set_backend_health(backend, false);
 
         }
@@ -495,6 +528,15 @@ namespace{
                 }
 
                 if(bytes_received == 0){
+                    if(stop_requested.load(std::memory_order_relaxed)){
+                        if(::shutdown(destination_fd, SHUT_RDWR) == -1){
+                            throw_system_error("shutdown", errno);
+                        }
+
+                        return;
+                    }
+
+
                     if(::shutdown(destination_fd, SHUT_WR) == -1){
                         throw_system_error("shutdown", errno);
                     }
@@ -556,7 +598,7 @@ namespace{
         }
     }
 
-    void proxy_connection(Socket client_socket){
+    void proxy_connection(Socket& client_socket){
         BackendConnection connection = connect_to_healthy_backend();
 
         Backend& backend = *connection.backend;
@@ -593,59 +635,112 @@ namespace{
 
 int main(){
     try{
+        struct sigaction action{};
+        action.sa_handler = handle_shutdown_signal;
+
+        sigemptyset(&action.sa_mask);
+
+        action.sa_flags = 0;
+
+        if(::sigaction(SIGINT, &action, nullptr) == -1){
+            throw_system_error("sigaction(SIGINT)", errno);
+        }
+
+        if(::sigaction(SIGTERM, &action, nullptr) == -1){
+            throw_system_error("sigaction(SIGTERM)", errno);
+        }
+
         Socket listening_socket = create_listening_socket(server_port);
 
-        std::thread health_check_thread{
-            health_check_loop};
+        std::jthread health_check_thread{
+            health_check_loop
+        };
 
-        health_check_thread.detach();
+        std::vector<std::jthread> connection_threads;
+
+        std::vector<std::weak_ptr<Socket>> active_client_sockets;
+
+        const auto shutdown_server = [&active_client_sockets](){
+            stop_requested.store(
+                true,
+                std::memory_order_relaxed
+            );
+
+            for(auto& weak_ptr_socket : active_client_sockets){
+                if(auto socket = weak_ptr_socket.lock()){
+                    if(socket->valid()){
+                        ::shutdown(
+                            socket->get(),
+                            SHUT_RDWR
+                        );
+                    }
+                }
+            }
+        };
 
         std::cout
             << "Server listening on port "
             << server_port
             << "\n";
 
-        while(1){
-            sockaddr_in client_address{};
-            socklen_t client_address_length = sizeof(client_address);
 
-            const int client_fd = ::accept(
-                listening_socket.get(),
-                reinterpret_cast<sockaddr*>(&client_address),
-                &client_address_length
-            );
+        try{    
+            while(!shutdown_signal_received){
+                sockaddr_in client_address{};
+                socklen_t client_address_length = sizeof(client_address);
 
-            if(client_fd == -1){
-                if(errno == EINTR){
-                    continue;
-                }
+                const int client_fd = ::accept(
+                    listening_socket.get(),
+                    reinterpret_cast<sockaddr*>(&client_address),
+                    &client_address_length
+                );
 
-                throw_system_error("accept", errno);
-            }
+                if(client_fd == -1){
+                    if(errno == EINTR){
+                        if(shutdown_signal_received){
+                            break;
+                        }
 
-            Socket client_socket{client_fd};
-
-            disable_sigpipe(client_socket.get());
-
-            print_client_address(client_address);
-
-            std::thread connection_thread{
-                [client_socket = std::move(client_socket)]() mutable{
-                    try{
-                        proxy_connection(std::move(client_socket));
-                    }catch(const std::exception& error){
-                        std::cerr
-                            << "Client connection error:"
-                            << error.what()
-                            << "\n";
+                        continue;
                     }
 
+                    throw_system_error("accept", errno);
                 }
-            };
 
-            connection_thread.detach();
-            
+                auto client_socket = std::make_shared<Socket>(client_fd);
+
+                disable_sigpipe(client_socket->get());
+
+                print_client_address(client_address);
+
+                active_client_sockets.emplace_back(client_socket);
+
+                connection_threads.emplace_back(
+                    [client_socket](){
+                        try{
+                            proxy_connection(*client_socket);
+                        }catch(const std::exception& error){
+                            std::cerr
+                                << "Client connection error:"
+                                << error.what()
+                                << "\n";
+                        }
+
+                    }
+                );
+                
+            }
+        }catch(...){
+            shutdown_server();
+
+            throw;
         }
+
+        shutdown_server();
+
+        std::cout  
+            << "Server shutting down\n";
+
     }catch(const std::exception& error){
         std::cerr
             << "Fatal error: "
@@ -653,5 +748,6 @@ int main(){
             << '\n';
         return 1;
     }
-    
+
+    return 0;
 }
