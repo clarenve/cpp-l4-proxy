@@ -14,8 +14,24 @@ add_executable(backend_server
     src/backend_main.cpp    
 )
 
-target_compile_features(proxy PRIVATE cxx_std_23)
-target_compile_features(backend_server PRIVATE cxx_std_23)
+add_executable(load_generator
+    src/load_generator.cpp
+)
+
+target_compile_features(
+    load_generator
+    PRIVATE cxx_std_23
+)
+
+target_compile_features(
+    proxy 
+    PRIVATE cxx_std_23
+)
+
+target_compile_features(
+    backend_server 
+    PRIVATE cxx_std_23
+)
 
 set_target_properties(
     proxy 
@@ -32,6 +48,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "AppleClang|Clang|GNU")
     )
 
     target_compile_options(backend_server PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+    )
+
+    target_compile_options(load_generator PRIVATE
         -Wall
         -Wextra
         -Wpedantic
