@@ -296,8 +296,7 @@ WorkerResult run_worker(
                 );
 
                 ++result.completed_requests;
-            }
-            catch(...) {
+            }catch(...) {
                 ++result.failed_requests;
 
                 // Stop using this persistent TCP
@@ -305,8 +304,7 @@ WorkerResult run_worker(
                 break;
             }
         }
-    }
-    catch(...) {
+    }catch(...) {
         result.failed_requests +=
             requests_per_client;
     }
@@ -554,8 +552,7 @@ int main(
                 )
                 << " us\n";
         }
-    }
-    catch(const std::exception& error) {
+    }catch(const std::exception& error) {
         std::cerr
             << "Fatal error: "
             << error.what()

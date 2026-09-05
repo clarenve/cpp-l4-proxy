@@ -1,6 +1,6 @@
 This document records the performance of the C++ Layer 4 TCP proxy across different implementation stages. Each test was performed three times, and the median result was recorded.
 
-Baseline results below are intended to serve as a reference for later comparisons against non-blocking epoll based architecture.
+Baseline results below are intended to serve as a reference for later comparisons against non-blocking kqueue/epoll based architecture.
 
 Blocking thread-per-connection results
 ======================================

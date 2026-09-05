@@ -8,34 +8,49 @@ project(
 
 add_executable(proxy
     src/main.cpp
+    src/socket.cpp
+    src/shutdown.cpp
+    src/backend.cpp
+    src/proxy.cpp
+    src/server.cpp
 )
 
 add_executable(backend_server
-    src/backend_main.cpp    
+    src/backend_main.cpp
 )
 
 add_executable(load_generator
     src/load_generator.cpp
 )
 
+target_include_directories(
+    proxy
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_compile_features(
+    proxy
+    PRIVATE
+        cxx_std_23
+)
+
+target_compile_features(
+    backend_server
+    PRIVATE
+        cxx_std_23
+)
+
 target_compile_features(
     load_generator
-    PRIVATE cxx_std_23
-)
-
-target_compile_features(
-    proxy 
-    PRIVATE cxx_std_23
-)
-
-target_compile_features(
-    backend_server 
-    PRIVATE cxx_std_23
+    PRIVATE
+        cxx_std_23
 )
 
 set_target_properties(
-    proxy 
+    proxy
     backend_server
+    load_generator
     PROPERTIES
         CXX_EXTENSIONS OFF
 )
