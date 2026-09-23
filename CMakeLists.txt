@@ -15,6 +15,13 @@ add_executable(proxy
     src/server.cpp
 )
 
+add_executable(proxy_kqueue
+    src/kqueue_main.cpp
+    src/socket.cpp
+    src/shutdown.cpp
+    src/kqueue_server.cpp
+)
+
 add_executable(backend_server
     src/backend_main.cpp
 )
@@ -25,6 +32,12 @@ add_executable(load_generator
 
 target_include_directories(
     proxy
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+target_include_directories(
+    proxy_kqueue
     PRIVATE
         ${PROJECT_SOURCE_DIR}/include
 )

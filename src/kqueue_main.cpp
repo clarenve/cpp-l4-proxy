@@ -1,4 +1,4 @@
-#include "server.hpp"
+#include "kqueue_server.hpp"
 #include "shutdown.hpp"
 
 #include <cstdint>
@@ -15,7 +15,7 @@ int main(){
     try{
         l4::install_signal_handlers();
 
-        l4::run_server(server_port);
+        l4::run_kqueue_server(server_port);
         
     }catch(const std::exception& error){
         std::cerr

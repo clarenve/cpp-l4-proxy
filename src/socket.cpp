@@ -8,6 +8,7 @@
 #include <iostream>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 namespace l4{
 
@@ -194,6 +195,33 @@ namespace l4{
             << ':'
             << ntohs(client_address.sin_port)
             << '\n';
+    }
+
+    void set_nonblocking(int socket_fd){
+        const int flags = 
+            ::fcntl(
+                socket_fd,
+                F_GETFL,
+                0
+            );
+
+        if(flags == -1){
+            throw_system_error(
+                "fcntl(F_GETFL)",
+                errno
+            );
+        }
+
+        if(::fcntl(
+            socket_fd,
+            F_SETFL,
+            flags | O_NONBLOCK
+        ) == -1){
+            throw_system_error(
+                "fcntl(F_SETFL)",
+                errno
+            );
+        }
     }
 
 }
