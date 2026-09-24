@@ -31,8 +31,11 @@ namespace l4{
         bool is_healthy
     );
 
-    BackendConnection
-    connect_to_healthy_backend();
+    Backend& choose_backend();
+
+    void set_backend_health(Backend& backend, bool is_healthy);
+
+    BackendConnection connect_to_healthy_backend();
 
     void health_check_loop();
 

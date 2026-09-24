@@ -249,33 +249,6 @@ namespace l4{
             }
         }
 
-
-        Backend& choose_backend(){
-            const std::size_t start_index =
-                next_backend_index.fetch_add(
-                    1,
-                    std::memory_order_relaxed
-                );
-
-            for(std::size_t offset = 0; offset < backends.size(); offset++){
-                Backend& backend =
-                    backends[
-                        (start_index + offset)
-                        % backends.size()
-                    ];
-
-                if(backend.healthy.load(
-                    std::memory_order_relaxed
-                )){
-                    return backend;
-                }
-            }
-
-            throw std::runtime_error(
-                "No healthy backends available"
-            );
-        }
-
     } // anonymous namespace
 
 
@@ -288,6 +261,31 @@ namespace l4{
         healthy{true}
     {}
 
+    Backend& choose_backend(){
+        const std::size_t start_index =
+            next_backend_index.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+
+        for(std::size_t offset = 0; offset < backends.size(); offset++){
+            Backend& backend =
+                backends[
+                    (start_index + offset)
+                    % backends.size()
+                ];
+
+            if(backend.healthy.load(
+                std::memory_order_relaxed
+            )){
+                return backend;
+            }
+        }
+
+        throw std::runtime_error(
+            "No healthy backends available"
+        );
+    }
 
     void set_backend_health(
         Backend& backend,

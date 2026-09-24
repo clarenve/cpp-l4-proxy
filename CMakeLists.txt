@@ -16,6 +16,7 @@ add_executable(proxy
 )
 
 add_executable(proxy_kqueue
+    src/backend.cpp
     src/kqueue_main.cpp
     src/socket.cpp
     src/shutdown.cpp
@@ -49,6 +50,12 @@ target_compile_features(
 )
 
 target_compile_features(
+    proxy_kqueue
+    PRIVATE
+        cxx_std_23
+)
+
+target_compile_features(
     backend_server
     PRIVATE
         cxx_std_23
@@ -62,6 +69,7 @@ target_compile_features(
 
 set_target_properties(
     proxy
+    proxy_kqueue
     backend_server
     load_generator
     PROPERTIES
