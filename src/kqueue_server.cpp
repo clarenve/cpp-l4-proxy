@@ -20,19 +20,29 @@
 #include <optional>
 #include <stdexcept>
 #include <cstring>
+#include <algorithm>
 
 namespace l4{
 
     namespace{
 
         constexpr std::size_t buffer_size = 4096;
+        constexpr std::size_t high_watermark = 64 * 1024;
+        constexpr std::size_t low_watermark = 16 * 1024;
+        static_assert(low_watermark < high_watermark);
         constexpr int max_events = 64;
 
         struct DirectionalBuffer{
-            std::array<char, buffer_size> data{};
+            std::array<char, high_watermark> data{};
             std::size_t size = 0;
             std::size_t offset = 0;
             bool read_eof = false;
+            bool read_paused = false;
+            bool write_shutdown = false;
+
+            std::size_t pending() const noexcept{
+                return size - offset;
+            }
         };
 
         struct Connection{
@@ -235,50 +245,84 @@ namespace l4{
             }
         }
 
+        bool finish_direction(int destination_fd, DirectionalBuffer& buffer){
+            if(!buffer.read_eof || buffer.pending() != 0 || buffer.write_shutdown){
+                return true;
+            }
+
+            if(::shutdown(destination_fd, SHUT_WR) == -1){
+                std::cerr
+                    << "shutdown failed for fd "
+                    << destination_fd
+                    << ": "
+                    << std::strerror(errno)
+                    << '\n';
+
+                return false;
+            }
+
+            buffer.write_shutdown = true;
+            return true;
+        }
+
         bool read_direction(
             int kqueue_fd,
             int source_fd,
             int destination_fd,
             DirectionalBuffer& buffer
         ){
-            if(buffer.read_eof || buffer.size != 0){
+            if(buffer.read_eof || buffer.read_paused){
                 return true;
             }
 
+            if(buffer.offset != 0){
+                const std::size_t pending = buffer.pending();
+
+                std::memmove(
+                    buffer.data.data(),
+                    buffer.data.data() + buffer.offset,
+                    pending
+                );
+
+                buffer.size = pending;
+                buffer.offset = 0;
+            }
+
             while(true){
+                if(buffer.pending() >= high_watermark){
+                    remove_read_event(kqueue_fd, source_fd);
+                    buffer.read_paused = true;
+                    return true;
+                }
+
+                const std::size_t available = std::min(
+                    buffer_size,
+                    high_watermark - buffer.size
+                );
+
                 const ssize_t received = ::recv(
                     source_fd,
-                    buffer.data.data(),
-                    buffer.data.size(),
+                    buffer.data.data() + buffer.size,
+                    available,
                     0
                 );
 
                 if(received > 0){
-                    buffer.size = static_cast<std::size_t>(received);
-                    buffer.offset = 0;
+                    const bool was_empty = buffer.pending() == 0;
 
-                    remove_read_event(kqueue_fd, source_fd);
-                    register_write_event(kqueue_fd, destination_fd);
-                    return true;
+                    buffer.size += static_cast<std::size_t>(received);
+
+                    if(was_empty){
+                        register_write_event(kqueue_fd, destination_fd);
+                    }
+
+                    continue;
                 }
 
                 if(received == 0){
                     buffer.read_eof = true;
                     remove_read_event(kqueue_fd, source_fd);
-
-                    // Reads resume only after pending bytes have been sent.
-                    if(::shutdown(destination_fd, SHUT_WR) == -1){
-                        std::cerr
-                            << "shutdown failed for fd "
-                            << destination_fd
-                            << ": "
-                            << std::strerror(errno)
-                            << '\n';
-
-                        return false;
-                    }
-
-                    return true;
+                    return finish_direction(destination_fd, buffer);
                 }
 
                 if(errno == EINTR){
@@ -316,6 +360,15 @@ namespace l4{
 
                 if(sent > 0){
                     buffer.offset += static_cast<std::size_t>(sent);
+
+                    if(buffer.read_paused &&
+                        !buffer.read_eof &&
+                        buffer.pending() <= low_watermark
+                    ){
+                        register_read_event(kqueue_fd, source_fd);
+                        buffer.read_paused = false;
+                    }
+
                     continue;
                 }
 
@@ -350,11 +403,7 @@ namespace l4{
 
             remove_write_event(kqueue_fd, destination_fd);
 
-            if(!buffer.read_eof){
-                register_read_event(kqueue_fd, source_fd);
-            }
-
-            return true;
+            return finish_direction(destination_fd, buffer);
         }
 
     }
@@ -622,8 +671,8 @@ namespace l4{
                     }
 
                     const bool finished =
-                        connection.client_to_backend.read_eof &&
-                        connection.backend_to_client.read_eof;
+                        connection.client_to_backend.write_shutdown &&
+                        connection.backend_to_client.write_shutdown;
 
                     if(!success || finished){
                         fd_to_connection.erase(client_fd);
