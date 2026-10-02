@@ -39,9 +39,17 @@ namespace l4{
             bool read_eof = false;
             bool read_paused = false;
             bool write_shutdown = false;
+            int errorcode = 0;
 
             std::size_t pending() const noexcept{
                 return size - offset;
+            }
+
+            bool finished() const noexcept{
+                return errorcode == 0 &&
+                    read_eof &&
+                    pending() == 0 &&
+                    write_shutdown;
             }
         };
 
@@ -245,24 +253,56 @@ namespace l4{
             }
         }
 
+        bool fail_direction(
+            DirectionalBuffer& buffer,
+            int socket_fd,
+            const char* operation,
+            int errorcode
+        ){
+            buffer.errorcode = errorcode;
+
+            std::cerr
+                << operation
+                << " failed for fd "
+                << socket_fd
+                << ": "
+                << std::strerror(errorcode)
+                << '\n';
+
+            return false;
+        }
+
         bool finish_direction(int destination_fd, DirectionalBuffer& buffer){
+            if(buffer.errorcode != 0){
+                return false;
+            }
+
             if(!buffer.read_eof || buffer.pending() != 0 || buffer.write_shutdown){
                 return true;
             }
 
-            if(::shutdown(destination_fd, SHUT_WR) == -1){
-                std::cerr
-                    << "shutdown failed for fd "
-                    << destination_fd
-                    << ": "
-                    << std::strerror(errno)
-                    << '\n';
+            while(::shutdown(destination_fd, SHUT_WR) == -1){
+                if(errno == EINTR){
+                    continue;
+                }
 
-                return false;
+                return fail_direction(buffer, destination_fd, "shutdown", errno);
             }
 
             buffer.write_shutdown = true;
             return true;
+        }
+
+        int event_error(const struct kevent& event){
+            if((event.flags & EV_ERROR) && event.data != 0){
+                return static_cast<int>(event.data);
+            }
+
+            if((event.flags & EV_EOF) && event.fflags != 0){
+                return static_cast<int>(event.fflags);
+            }
+
+            return 0;
         }
 
         bool read_direction(
@@ -271,6 +311,10 @@ namespace l4{
             int destination_fd,
             DirectionalBuffer& buffer
         ){
+            if(buffer.errorcode != 0){
+                return false;
+            }
+
             if(buffer.read_eof || buffer.read_paused){
                 return true;
             }
@@ -333,14 +377,7 @@ namespace l4{
                     return true;
                 }
 
-                std::cerr
-                    << "recv failed for fd "
-                    << source_fd
-                    << ": "
-                    << std::strerror(errno)
-                    << '\n';
-
-                return false;
+                return fail_direction(buffer, source_fd, "recv", errno);
             }
         }
 
@@ -350,6 +387,15 @@ namespace l4{
             int destination_fd,
             DirectionalBuffer& buffer
         ){
+            if(buffer.errorcode != 0){
+                return false;
+            }
+
+            // A notification may remain in the current batch after its filter is removed.
+            if(buffer.pending() == 0){
+                return finish_direction(destination_fd, buffer);
+            }
+
             while(buffer.offset < buffer.size){
                 const ssize_t sent = ::send(
                     destination_fd,
@@ -382,20 +428,10 @@ namespace l4{
                         return true;
                     }
 
-                    std::cerr
-                        << "send failed for fd "
-                        << destination_fd
-                        << ": "
-                        << std::strerror(errno)
-                        << '\n';
-                }else{
-                    std::cerr
-                        << "send made no progress for fd "
-                        << destination_fd
-                        << '\n';
+                    return fail_direction(buffer, destination_fd, "send", errno);
                 }
 
-                return false;
+                return fail_direction(buffer, destination_fd, "send (no progress)", EIO);
             }
 
             buffer.size = 0;
@@ -428,6 +464,24 @@ namespace l4{
 
         std::unordered_map<int, std::unique_ptr<Connection>> connections;
         std::unordered_map<int, Connection*> fd_to_connection;
+
+        std::vector<std::unique_ptr<Connection>> retired_connections;
+        retired_connections.reserve(max_events);
+
+        const auto retire_connection = [&](Connection& connection){
+            const int client_fd = connection.client_socket.get();
+            const int backend_fd = connection.backend_socket.get();
+
+            fd_to_connection.erase(client_fd);
+            fd_to_connection.erase(backend_fd);
+
+            auto connection_it = connections.find(client_fd);
+
+            if(connection_it != connections.end()){
+                retired_connections.push_back(std::move(connection_it->second));
+                connections.erase(connection_it);
+            }
+        };
 
         std::vector<struct kevent> events(max_events);
 
@@ -465,6 +519,16 @@ namespace l4{
                     const int event_fd = static_cast<int>(event.ident);
 
                     if(event_fd == listening_socket.get()){ //accept new incoming clients
+                        const int errorcode = event_error(event);
+
+                        if(errorcode != 0){
+                            throw_system_error("kevent(listener)", errorcode);
+                        }
+
+                        if(event.flags & EV_ERROR || event.filter != EVFILT_READ){
+                            continue;
+                        }
+
                         while(1){
                             sockaddr_in client_address{};
 
@@ -575,13 +639,28 @@ namespace l4{
                     }
 
                     Connection& connection = *connection_it->second;
+                    const int errorcode = event_error(event);
+
+                    if(event.flags & EV_ERROR){
+                        if(errorcode != 0){
+                            fail_direction(
+                                connection.client_to_backend,
+                                event_fd,
+                                "kevent",
+                                errorcode
+                            );
+                            retire_connection(connection);
+                        }
+
+                        continue;
+                    }
 
                     if(event_fd == connection.backend_socket.get() &&
                         event.filter == EVFILT_WRITE &&
                         connection.backend_connecting
                     ){
-                        const int socket_error =
-                            get_socket_error(connection.backend_socket.get());
+                        const int connect_error = get_socket_error(connection.backend_socket.get());
+                        const int socket_error = connect_error != 0 ? connect_error : errorcode;
 
                         remove_write_event(
                             kqueue_socket.get(),
@@ -603,16 +682,7 @@ namespace l4{
                                 false
                             );
 
-                            const int client_fd =
-                                connection.client_socket.get();
-
-                            const int backend_fd =
-                                connection.backend_socket.get();
-
-                            fd_to_connection.erase(client_fd);
-                            fd_to_connection.erase(backend_fd);
-
-                            connections.erase(client_fd);
+                            retire_connection(connection);
 
                             continue;
                         }
@@ -638,6 +708,16 @@ namespace l4{
                     const int backend_fd = connection.backend_socket.get();
                     const bool from_client = event_fd == client_fd;
 
+                    if(errorcode != 0){
+                        DirectionalBuffer& buffer = event.filter == EVFILT_WRITE
+                            ? (from_client ? connection.backend_to_client : connection.client_to_backend)
+                            : (from_client ? connection.client_to_backend : connection.backend_to_client);
+
+                        fail_direction(buffer, event_fd, "kevent(socket)", errorcode);
+                        retire_connection(connection);
+                        continue;
+                    }
+
                     bool success = true;
 
                     if(event.filter == EVFILT_READ){
@@ -647,6 +727,7 @@ namespace l4{
                             ? connection.client_to_backend
                             : connection.backend_to_client;
 
+                        // EV_EOF may accompany unread data. Only recv() == 0 completes the source.
                         success = read_direction(
                             kqueue_socket.get(),
                             event_fd,
@@ -660,30 +741,34 @@ namespace l4{
                             ? connection.backend_to_client
                             : connection.client_to_backend;
 
-                        success = write_direction(
-                            kqueue_socket.get(),
-                            source_fd,
-                            event_fd,
-                            buffer
-                        );
+                        if((event.flags & EV_EOF) && buffer.pending() != 0){
+                            success = fail_direction(buffer, event_fd, "kevent(write EOF)", EPIPE);
+                        }else{
+                            success = write_direction(
+                                kqueue_socket.get(),
+                                source_fd,
+                                event_fd,
+                                buffer
+                            );
+                        }
                     }else{
                         continue;
                     }
 
                     const bool finished =
-                        connection.client_to_backend.write_shutdown &&
-                        connection.backend_to_client.write_shutdown;
+                        connection.client_to_backend.finished() &&
+                        connection.backend_to_client.finished();
 
                     if(!success || finished){
-                        fd_to_connection.erase(client_fd);
-                        fd_to_connection.erase(backend_fd);
-
-                        // Socket destruction closes both fds and removes their filters.
-                        connections.erase(client_fd);
+                        retire_connection(connection);
+                        continue;
                     }
 
                 }
 
+            // Keep retired fds open until no stale events from this batch remain.
+            // Closing the sockets also removes their remaining kqueue filters.
+            retired_connections.clear();
         }
 
         std::cout << "kqueue server shutting down\n";
