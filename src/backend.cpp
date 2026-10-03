@@ -287,6 +287,31 @@ namespace l4{
         );
     }
 
+    std::vector<Backend*> backend_candidates(){
+        const std::size_t start_index =
+            next_backend_index.fetch_add(1, std::memory_order_relaxed);
+
+        std::vector<Backend*> healthy;
+        std::vector<Backend*> unhealthy;
+
+        healthy.reserve(backends.size());
+        unhealthy.reserve(backends.size());
+
+        for(std::size_t offset = 0; offset < backends.size(); offset++){
+            Backend& backend =
+                backends[(start_index + offset) % backends.size()];
+
+            if(backend.healthy.load(std::memory_order_relaxed)){
+                healthy.push_back(&backend);
+            }else{
+                unhealthy.push_back(&backend);
+            }
+        }
+
+        healthy.insert(healthy.end(), unhealthy.begin(), unhealthy.end());
+        return healthy;
+    }
+
     void set_backend_health(
         Backend& backend,
         bool is_healthy

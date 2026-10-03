@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace l4{
 
@@ -32,6 +33,8 @@ namespace l4{
     );
 
     Backend& choose_backend();
+
+    std::vector<Backend*> backend_candidates();
 
     void set_backend_health(Backend& backend, bool is_healthy);
 
