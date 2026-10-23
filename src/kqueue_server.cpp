@@ -30,6 +30,7 @@ namespace l4{
         using Clock = std::chrono::steady_clock;
 
         constexpr auto connect_timeout = std::chrono::seconds{1};
+        constexpr auto drain_timeout = std::chrono::seconds{30};
 
         enum class ConnectionState{
             connecting,
@@ -194,6 +195,24 @@ namespace l4{
                 nullptr
             ) == -1){
                 throw_system_error("kevent(EV_ADD, EVFILT_READ)", errno);
+            }
+        }
+
+        void register_signal_event(int kqueue_fd, int signal_number){
+            struct kevent change{};
+
+            EV_SET(
+                &change,
+                static_cast<uintptr_t>(signal_number),
+                EVFILT_SIGNAL,
+                EV_ADD,
+                0,
+                0,
+                nullptr
+            );
+
+            if(::kevent(kqueue_fd, &change, 1, nullptr, 0, nullptr) == -1){
+                throw_system_error("kevent(EV_ADD, EVFILT_SIGNAL)", errno);
             }
         }
 
@@ -488,6 +507,8 @@ namespace l4{
         Socket kqueue_socket{kqueue_fd};
 
         register_read_event(kqueue_socket.get(), listening_socket.get());
+        register_signal_event(kqueue_socket.get(), SIGINT);
+        register_signal_event(kqueue_socket.get(), SIGTERM);
 
         std::unordered_map<int, std::unique_ptr<Connection>> connections;
         std::unordered_map<int, Connection*> fd_to_connection;
@@ -496,6 +517,34 @@ namespace l4{
         retired_connections.reserve(max_events);
 
         std::vector<Socket> retired_backend_sockets;
+
+        bool draining = false;
+        Clock::time_point drain_deadline{};
+
+        const auto begin_draining = [&](){
+            if(draining){
+                return;
+            }
+
+            draining = true;
+            drain_deadline = Clock::now() + drain_timeout;
+            remove_read_event(kqueue_socket.get(), listening_socket.get());
+
+            std::cout
+                << "Server draining "
+                << connections.size()
+                << " existing connections\n";
+        };
+
+        const auto observe_shutdown = [&](){
+            if(shutdown_signal_received){
+                begin_draining();
+            }
+        };
+
+        const auto drain_expired = [&](){
+            return draining && Clock::now() >= drain_deadline;
+        };
 
         const auto retire_connection = [&](Connection& connection){
             const int client_fd = connection.client_socket.get();
@@ -560,6 +609,12 @@ namespace l4{
 
             try{
                 while(connection.next_candidate < connection.candidates.size()){
+                    observe_shutdown();
+
+                    if(drain_expired()){
+                        return false;
+                    }
+
                     connection.backend = connection.candidates[connection.next_candidate++];
                     connection.connect_deadline = Clock::now() + connect_timeout;
 
@@ -604,6 +659,12 @@ namespace l4{
         };
 
         const auto retry_backend = [&](Connection& connection, int errorcode){
+            observe_shutdown();
+
+            if(drain_expired()){
+                return false;
+            }
+
             if(connection.state != ConnectionState::connecting){
                 return false;
             }
@@ -631,8 +692,32 @@ namespace l4{
             << port
             << '\n';
 
-        while(!shutdown_signal_received){
+        while(true){
+            observe_shutdown();
+
+            // No events from a previous batch will be inspected after this point.
+            if(draining && listening_socket.valid()){
+                listening_socket.reset();
+            }
+
+            if(draining && connections.empty()){
+                std::cout << "All connections drained\n";
+                break;
+            }
+
+            if(drain_expired()){
+                std::cerr
+                    << "Drain deadline reached; closing "
+                    << connections.size()
+                    << " remaining connections\n";
+                break;
+            }
+
             std::optional<Clock::time_point> earliest_deadline;
+
+            if(draining){
+                earliest_deadline = drain_deadline;
+            }
 
             for(const auto& entry : connections){
                 const Connection& connection = *entry.second;
@@ -670,10 +755,6 @@ namespace l4{
             
                 if(event_count == -1){
                     if(errno == EINTR){
-                        if(shutdown_signal_received){
-                            break;
-                        }
-
                         continue;
                     }
 
@@ -681,11 +762,35 @@ namespace l4{
                 }
 
                 for(int i = 0; i < event_count; i++){
+                    observe_shutdown();
+
+                    if(drain_expired()){
+                        break;
+                    }
+
                     const struct kevent& event = events[i];
+
+                    // Signal identifiers are signal numbers, not socket descriptors.
+                    if(event.filter == EVFILT_SIGNAL){
+                        if(event.flags & EV_ERROR){
+                            if(event.data != 0){
+                                throw_system_error("kevent(signal)", static_cast<int>(event.data));
+                            }
+
+                            continue;
+                        }
+
+                        begin_draining();
+                        continue;
+                    }
 
                     const int event_fd = static_cast<int>(event.ident);
 
                     if(event_fd == listening_socket.get()){ //accept new incoming clients
+                        if(draining){
+                            continue;
+                        }
+
                         const int errorcode = event_error(event);
 
                         if(errorcode != 0){
@@ -697,6 +802,12 @@ namespace l4{
                         }
 
                         for(int accepted = 0; accepted < max_events; accepted++){
+                            observe_shutdown();
+
+                            if(draining){
+                                break;
+                            }
+
                             sockaddr_in client_address{};
 
                             socklen_t client_address_length = sizeof(client_address);
@@ -721,6 +832,12 @@ namespace l4{
                             }
 
                             Socket client_socket{client_fd};
+                            observe_shutdown();
+
+                            if(draining){
+                                break;
+                            }
+
                             std::unique_ptr<Connection> connection;
 
                             try{
@@ -737,6 +854,12 @@ namespace l4{
                                     << error.what()
                                     << '\n';
                                 continue;
+                            }
+
+                            observe_shutdown();
+
+                            if(draining){
+                                break;
                             }
 
                             Connection* connection_ptr = connection.get();
@@ -871,6 +994,13 @@ namespace l4{
 
                 }
 
+            observe_shutdown();
+
+            // Skip stale listener events throughout the batch before releasing its fd.
+            if(draining && listening_socket.valid()){
+                listening_socket.reset();
+            }
+
             const auto now = Clock::now();
             std::vector<Connection*> expired_connections;
 
@@ -883,6 +1013,12 @@ namespace l4{
             }
 
             for(Connection* connection : expired_connections){
+                observe_shutdown();
+
+                if(drain_expired()){
+                    break;
+                }
+
                 if(!retry_backend(*connection, ETIMEDOUT)){
                     retire_connection(*connection);
                 }
